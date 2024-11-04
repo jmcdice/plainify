@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+import re
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+import fitz  # PyMuPDF
+from docling.document_converter import DocumentConverter
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
+
+@dataclass
+class ConversionPaths:
+    input_pdf: Path
+    intermediate_md: Path
+    output_simplified_md: Path
+
+class PDFConverter:
+    def __init__(self, max_chunk_size: int = 7000, concurrent_requests: int = 5):
+        self.max_chunk_size = max_chunk_size
+        self.semaphore = asyncio.Semaphore(concurrent_requests)
+        self.client: Optional[AsyncOpenAI] = None
+        self.logger = self._setup_logging()
+
+    @staticmethod
+    def _setup_logging() -> logging.Logger:
+        logger = logging.getLogger("PDFConverter")
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        return logger
+
+    async def initialize_client(self) -> None:
+        """Initialize the OpenAI client."""
+        try:
+            self.client = AsyncOpenAI()
+        except Exception as e:
+            self.logger.error(f"Failed to initialize OpenAI client: {e}")
+            raise
+
+    @staticmethod
+    def create_paths(input_pdf: str, output_md: str) -> ConversionPaths:
+        """Create and validate all necessary paths."""
+        input_path = Path(input_pdf)
+        output_path = Path(output_md)
+        
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Input PDF file does not exist: {input_pdf}")
+            
+        output_dir = output_path.parent
+        base_name = output_path.stem
+        intermediate_md = output_dir / f"{base_name}_original.md"
+        
+        return ConversionPaths(input_path, intermediate_md, output_path)
+
+    async def convert_pdf_to_markdown(self, paths: ConversionPaths) -> None:
+        """Convert PDF to Markdown using DocumentConverter."""
+        self.logger.info(f"Converting PDF to Markdown: {paths.input_pdf}")
+        try:
+            with ThreadPoolExecutor() as executor:
+                converter = DocumentConverter()
+                result = await asyncio.get_event_loop().run_in_executor(
+                    executor,
+                    lambda: converter.convert(str(paths.input_pdf))
+                )
+            
+            paths.intermediate_md.write_text(
+                result.document.export_to_markdown(),
+                encoding="utf-8"
+            )
+            self.logger.info(f"Created intermediate Markdown: {paths.intermediate_md}")
+        except Exception as e:
+            self.logger.error(f"PDF conversion failed: {e}")
+            raise
+
+    def split_text_into_chunks(self, text: str) -> List[str]:
+        """Split text into chunks while preserving sentence boundaries."""
+        sentences = re.split(r'(?<=[.!?]) +', text)
+        chunks: List[str] = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) + 1 <= self.max_chunk_size:
+                current_chunk += sentence + " "
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + " "
+                
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+            
+        return chunks
+
+    async def process_chunk_with_ai(self, chunk: str) -> str:
+        """Process a single chunk of text using OpenAI's API."""
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized")
+
+        prompt = (
+            "Please provide a layman's summary of the following text, explaining complex terms "
+            "and phrases in parentheses next to them. Keep the explanation understandable by "
+            "avoiding technical jargon or, where necessary, providing definitions in simple terms. "
+            "Only return the full summary, nothing else.\n\n"
+            f"Text:\n{chunk}\n"
+        )
+
+        try:
+            async with self.semaphore:
+                response: ChatCompletion = await self.client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=2000,
+                    temperature=0.5,
+                )
+                return response.choices[0].message.content
+        except Exception as e:
+            self.logger.error(f"AI processing failed for chunk: {e}")
+            return ""
+
+    async def process_markdown(self, paths: ConversionPaths) -> None:
+        """Process the entire Markdown document."""
+        try:
+            text = paths.intermediate_md.read_text(encoding="utf-8")
+            if not text.strip():
+                raise ValueError("No text could be extracted from the Markdown")
+
+            chunks = self.split_text_into_chunks(text)
+            self.logger.info(f"Processing {len(chunks)} chunks...")
+
+            tasks = [self.process_chunk_with_ai(chunk) for chunk in chunks]
+            summaries = await asyncio.gather(*tasks)
+            
+            simplified_content = "\n\n".join(filter(None, summaries))
+            paths.output_simplified_md.write_text(
+                simplified_content,
+                encoding="utf-8"
+            )
+            
+            self.logger.info(f"Created simplified Markdown: {paths.output_simplified_md}")
+            
+        except Exception as e:
+            self.logger.error(f"Markdown processing failed: {e}")
+            raise
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Convert a medical PDF to simplified Markdown with explanations."
+    )
+    parser.add_argument("input_pdf", help="Path to the input PDF file")
+    parser.add_argument("output_md", help="Path to save the simplified output Markdown file")
+    args = parser.parse_args()
+
+    converter = PDFConverter()
+    
+    try:
+        paths = converter.create_paths(args.input_pdf, args.output_md)
+        await converter.initialize_client()
+        await converter.convert_pdf_to_markdown(paths)
+        await converter.process_markdown(paths)
+        
+        converter.logger.info("\nConversion completed successfully!")
+        converter.logger.info(f"Original Markdown: {paths.intermediate_md}")
+        converter.logger.info(f"Simplified Markdown: {paths.output_simplified_md}")
+        
+    except Exception as e:
+        converter.logger.error(f"Conversion failed: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())

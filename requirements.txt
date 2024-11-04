@@ -1,0 +1,6 @@
+PyMuPDF
+docling
+openai
+Pillow
+python-dotenv
+pytesseract
