@@ -13,18 +13,31 @@ from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import io
 
-import fitz  # PyMuPDF
+import fitz
 from docling.document_converter import DocumentConverter
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
+import markdown
+import markdownify
 
 @dataclass
 class ConversionPaths:
+    """Data class to store paths used during conversion."""
     input_pdf: Path
     intermediate_md: Path
     output_simplified_md: Path
 
 class PDFConverter:
+    """
+    A class to handle the conversion of PDF documents to simplified Markdown.
+
+    Attributes:
+        max_chunk_size (int): Maximum size of each text chunk.
+        semaphore (asyncio.Semaphore): Semaphore to limit concurrent AI requests.
+        client (Optional[AsyncOpenAI]): Asynchronous OpenAI client.
+        logger (logging.Logger): Logger for logging information and errors.
+    """
+
     def __init__(self, max_chunk_size: int = 7000, concurrent_requests: int = 5):
         self.max_chunk_size = max_chunk_size
         self.semaphore = asyncio.Semaphore(concurrent_requests)
@@ -33,6 +46,7 @@ class PDFConverter:
 
     @staticmethod
     def _setup_logging() -> logging.Logger:
+        """Set up the logger for the PDFConverter."""
         logger = logging.getLogger("PDFConverter")
         handler = logging.StreamHandler()
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -45,13 +59,26 @@ class PDFConverter:
         """Initialize the OpenAI client."""
         try:
             self.client = AsyncOpenAI()
+            self.logger.info("OpenAI client initialized successfully.")
         except Exception as e:
             self.logger.error(f"Failed to initialize OpenAI client: {e}")
             raise
 
     @staticmethod
     def create_paths(input_pdf: str, output_md: str) -> ConversionPaths:
-        """Create and validate all necessary paths."""
+        """
+        Create and validate all necessary paths.
+
+        Args:
+            input_pdf (str): Path to the input PDF file.
+            output_md (str): Path to the output Markdown file.
+
+        Returns:
+            ConversionPaths: An instance containing all relevant paths.
+
+        Raises:
+            FileNotFoundError: If the input PDF does not exist.
+        """
         input_path = Path(input_pdf)
         output_path = Path(output_md)
         
@@ -65,18 +92,31 @@ class PDFConverter:
         return ConversionPaths(input_path, intermediate_md, output_path)
 
     async def convert_pdf_to_markdown(self, paths: ConversionPaths) -> None:
-        """Convert PDF to Markdown using DocumentConverter."""
+        """
+        Convert PDF to Markdown using DocumentConverter.
+
+        Args:
+            paths (ConversionPaths): Paths required for conversion.
+
+        Raises:
+            Exception: If the conversion fails.
+        """
         self.logger.info(f"Converting PDF to Markdown: {paths.input_pdf}")
         try:
             with ThreadPoolExecutor() as executor:
-                with contextlib.redirect_stderr(io.StringIO()):  # Add this line
+                with contextlib.redirect_stderr(io.StringIO()):
                     converter = DocumentConverter()
                     result = await asyncio.get_event_loop().run_in_executor(
                         executor,
                         lambda: converter.convert(str(paths.input_pdf))
                     )
+            markdown_content = result.document.export_to_markdown()
+
+            # Optionally, process the markdown to ensure consistency
+            markdown_content = self._post_process_markdown(markdown_content)
+
             paths.intermediate_md.write_text(
-                result.document.export_to_markdown(),
+                markdown_content,
                 encoding="utf-8"
             )
             self.logger.info(f"Created intermediate Markdown: {paths.intermediate_md}")
@@ -84,8 +124,34 @@ class PDFConverter:
             self.logger.error(f"PDF conversion failed: {e}")
             raise
 
+    def _post_process_markdown(self, markdown_text: str) -> str:
+        """
+        Post-process the generated Markdown to ensure consistency and improve formatting.
+
+        Args:
+            markdown_text (str): The raw Markdown text.
+
+        Returns:
+            str: The processed Markdown text.
+        """
+        # Example: Ensure all headers use Markdown's # syntax
+        markdown_text = re.sub(r'^(={3,})$', '#', markdown_text, flags=re.MULTILINE)
+
+        # Additional processing can be added here
+        # For example, handling tables, images, links, etc.
+
+        return markdown_text
+
     def split_text_into_chunks(self, text: str) -> List[str]:
-        """Split text into chunks while preserving sentence boundaries."""
+        """
+        Split text into chunks while preserving sentence boundaries.
+
+        Args:
+            text (str): The text to split.
+
+        Returns:
+            List[str]: A list of text chunks.
+        """
         sentences = re.split(r'(?<=[.!?]) +', text)
         chunks: List[str] = []
         current_chunk = ""
@@ -104,34 +170,81 @@ class PDFConverter:
         return chunks
 
     async def process_chunk_with_ai(self, chunk: str) -> str:
-        """Process a single chunk of text using OpenAI's API."""
+        """
+        Process a single chunk of text using OpenAI's API.
+
+        Args:
+            chunk (str): The text chunk to process.
+
+        Returns:
+            str: The simplified Markdown text.
+
+        Logs:
+            Errors encountered during AI processing.
+        """
         if not self.client:
             raise RuntimeError("OpenAI client not initialized")
 
         prompt = (
+            "Your task is to translate this technical document to aproachable language. "
             "Convert the following text to simpler language, preserving its original structure. "
             "Replace technical or complex terms with simpler alternatives, adding brief parenthetical "
             "explanations for medical/technical terms when needed. Maintain the same flow and format "
-            "as the original text, but make it easier to understand. Don't summarize or reference the text - "
-            "just convert it directly to simpler language.\n\n"
+            "as the original text, but make it easier to understand. This will be read aloud so remove "
+            "the authors and just ignore tables. Don't summarize or reference the text—just convert it "
+            "directly to simpler language. Return only the formatted markdown, nothing else.\n\n"
             f"Text:\n{chunk}\n"
         )
         
         try:
             async with self.semaphore:
                 response: ChatCompletion = await self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    #model="gpt-3.5-turbo",
+                    model="gpt-4",
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=2000,
                     temperature=0.5,
                 )
-                return response.choices[0].message.content
+                simplified_text = response.choices[0].message.content
+
+                # Optional: Further process the simplified_text to ensure valid Markdown
+                simplified_text = self._validate_markdown(simplified_text)
+
+                return simplified_text
         except Exception as e:
             self.logger.error(f"AI processing failed for chunk: {e}")
             return ""
 
+    def _validate_markdown(self, markdown_text: str) -> str:
+        """
+        Validate and optionally format the Markdown text.
+
+        Args:
+            markdown_text (str): The Markdown text to validate.
+
+        Returns:
+            str: Validated and formatted Markdown text.
+        """
+        # Attempt to parse the markdown to ensure it's valid
+        try:
+            html = markdown.markdown(markdown_text)
+            # Optionally, re-convert HTML back to Markdown to fix issues
+            # markdown_text = markdownify.markdownify(html, heading_style="ATX")
+        except Exception as e:
+            self.logger.warning(f"Markdown validation failed: {e}")
+            # Depending on requirements, you might want to handle or log the error
+        return markdown_text
+
     async def process_markdown(self, paths: ConversionPaths) -> None:
-        """Process the entire Markdown document."""
+        """
+        Process the entire Markdown document to simplify it.
+
+        Args:
+            paths (ConversionPaths): Paths required for processing.
+
+        Raises:
+            Exception: If the processing fails.
+        """
         try:
             text = paths.intermediate_md.read_text(encoding="utf-8")
             if not text.strip():
@@ -144,6 +257,10 @@ class PDFConverter:
             summaries = await asyncio.gather(*tasks)
             
             simplified_content = "\n\n".join(filter(None, summaries))
+            
+            # Optionally, format the final Markdown
+            simplified_content = self._format_final_markdown(simplified_content)
+
             paths.output_simplified_md.write_text(
                 simplified_content,
                 encoding="utf-8"
@@ -155,7 +272,28 @@ class PDFConverter:
             self.logger.error(f"Markdown processing failed: {e}")
             raise
 
+    def _format_final_markdown(self, markdown_text: str) -> str:
+        """
+        Format the final Markdown content for consistency.
+
+        Args:
+            markdown_text (str): The simplified Markdown text.
+
+        Returns:
+            str: Formatted Markdown text.
+        """
+        # Example: Ensure consistent header formatting, list indentation, etc.
+        # This can be expanded based on specific needs
+
+        # Example: Replace multiple blank lines with a single blank line
+        markdown_text = re.sub(r'\n{3,}', '\n\n', markdown_text)
+
+        return markdown_text
+
 async def main() -> None:
+    """
+    The main entry point for the PDF to Markdown conversion script.
+    """
     parser = argparse.ArgumentParser(
         description="Convert a medical PDF to simplified Markdown with explanations."
     )
@@ -181,3 +319,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
