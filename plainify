@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import List, Optional
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
 
 import fitz  # PyMuPDF
 from docling.document_converter import DocumentConverter
@@ -67,12 +69,12 @@ class PDFConverter:
         self.logger.info(f"Converting PDF to Markdown: {paths.input_pdf}")
         try:
             with ThreadPoolExecutor() as executor:
-                converter = DocumentConverter()
-                result = await asyncio.get_event_loop().run_in_executor(
-                    executor,
-                    lambda: converter.convert(str(paths.input_pdf))
-                )
-            
+                with contextlib.redirect_stderr(io.StringIO()):  # Add this line
+                    converter = DocumentConverter()
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        executor,
+                        lambda: converter.convert(str(paths.input_pdf))
+                    )
             paths.intermediate_md.write_text(
                 result.document.export_to_markdown(),
                 encoding="utf-8"
@@ -107,13 +109,14 @@ class PDFConverter:
             raise RuntimeError("OpenAI client not initialized")
 
         prompt = (
-            "Please provide a layman's summary of the following text, explaining complex terms "
-            "and phrases in parentheses next to them. Keep the explanation understandable by "
-            "avoiding technical jargon or, where necessary, providing definitions in simple terms. "
-            "Only return the full summary, nothing else.\n\n"
+            "Convert the following text to simpler language, preserving its original structure. "
+            "Replace technical or complex terms with simpler alternatives, adding brief parenthetical "
+            "explanations for medical/technical terms when needed. Maintain the same flow and format "
+            "as the original text, but make it easier to understand. Don't summarize or reference the text - "
+            "just convert it directly to simpler language.\n\n"
             f"Text:\n{chunk}\n"
         )
-
+        
         try:
             async with self.semaphore:
                 response: ChatCompletion = await self.client.chat.completions.create(
@@ -168,7 +171,7 @@ async def main() -> None:
         await converter.convert_pdf_to_markdown(paths)
         await converter.process_markdown(paths)
         
-        converter.logger.info("\nConversion completed successfully!")
+        converter.logger.info("Conversion completed successfully!")
         converter.logger.info(f"Original Markdown: {paths.intermediate_md}")
         converter.logger.info(f"Simplified Markdown: {paths.output_simplified_md}")
         
